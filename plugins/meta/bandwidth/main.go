@@ -20,6 +20,7 @@ import (
 	"math"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
@@ -131,9 +132,9 @@ func getMTU(deviceName string) (int, error) {
 }
 
 // get the veth peer of container interface in host namespace
-func getHostInterface(interfaces []*current.Interface, containerIfName string, netns ns.NetNS) (*current.Interface, error) {
+func getHostInterface(interfaces []*current.Interface, containerIfName string, netns ns.NetNS) (bool, *current.Interface, error) {
 	if len(interfaces) == 0 {
-		return nil, fmt.Errorf("no interfaces provided")
+		return false, nil, fmt.Errorf("no interfaces provided")
 	}
 
 	// get veth peer index of container interface
@@ -144,21 +145,150 @@ func getHostInterface(interfaces []*current.Interface, containerIfName string, n
 		return nil
 	})
 	if peerIndex <= 0 {
-		return nil, fmt.Errorf("container interface %s has no veth peer: %v", containerIfName, err)
+		fmt.Println("***CHENYANG***, peerIndex <= 0")
+		return true, nil, nil
+		// return nil, fmt.Errorf("container interface %s has no veth peer: %v", containerIfName, err)
 	}
 
 	// find host interface by index
 	link, err := netlink.LinkByIndex(peerIndex)
 	if err != nil {
-		return nil, fmt.Errorf("veth peer with index %d is not in host ns", peerIndex)
+		return false, nil, fmt.Errorf("veth peer with index %d is not in host ns", peerIndex)
 	}
 	for _, iface := range interfaces {
 		if iface.Sandbox == "" && iface.Name == link.Attrs().Name {
-			return iface, nil
+			return false, iface, nil
 		}
 	}
 
-	return nil, fmt.Errorf("no veth peer of container interface found in host ns")
+	return false, nil, fmt.Errorf("no veth peer of container interface found in host ns")
+}
+
+func safeQdiscList(link netlink.Link) ([]netlink.Qdisc, error) {
+	qdiscs, err := netlink.QdiscList(link)
+	if err != nil {
+		return nil, err
+	}
+	result := []netlink.Qdisc{}
+	for _, qdisc := range qdiscs {
+		// filter out pfifo_fast qdiscs because
+		// older kernels don't return them
+		_, pfifo := qdisc.(*netlink.PfifoFast)
+		if !pfifo {
+			result = append(result, qdisc)
+		}
+	}
+	return result, nil
+}
+
+func createwithtc(ns ns.NetNS, egress, egressBurst uint64, name string) error {
+	// fmt.Printf("tc set NIC %q of egress %d ingress %d in namespace %q\n", eth0, egress, ingress, namespace)
+	// netns, err := ns.GetNS(namespace)
+	// if err != nil {
+	// 	fmt.Printf("failed to open netns %q: %v", namespace, err)
+	// 	return
+	// }
+
+	defer ns.Close()
+
+	// _ = netns.Do(func(_ ns.NetNS) error {
+
+	// egress
+	l, err := netlink.LinkByName(name)
+	if err != nil {
+		fmt.Printf("get link by name %s in the container namespace %s\n", name, err)
+	}
+
+	qdiscs, err := safeQdiscList(l)
+	if err != nil {
+		fmt.Printf("get current qdisc in the container namespace of %s\n", err)
+	}
+	var htb *netlink.Htb
+	var hasHtb = false
+	for _, qdisc := range qdiscs {
+		fmt.Printf("current qdisc is %s\n", qdisc)
+
+		h, isHTB := qdisc.(*netlink.Htb)
+		if isHTB {
+			htb = h
+			hasHtb = true
+			break
+		}
+	}
+
+	if !hasHtb {
+		// qdisc
+		// tc qdisc add dev lo root handle 1:0 htb default 1
+		attrs := netlink.QdiscAttrs{
+			LinkIndex: l.Attrs().Index,
+			Handle:    netlink.MakeHandle(1, 0),
+			Parent:    netlink.HANDLE_ROOT,
+		}
+		htb = netlink.NewHtb(attrs)
+		err = netlink.QdiscAdd(htb)
+		if err != nil {
+			fmt.Println("QdiscAdd error: %s\n", err)
+		}
+	}
+
+	// htb parent class
+	// tc class add dev lo parent 1:0 classid 1:1 htb rate 125Mbps ceil 125Mbps prio 0
+	// preconfig
+	classattrs1 := netlink.ClassAttrs{
+		LinkIndex: l.Attrs().Index,
+		Parent:    netlink.MakeHandle(1, 0),
+		Handle:    netlink.MakeHandle(1, 1),
+	}
+	htbclassattrs1 := netlink.HtbClassAttrs{
+		Rate:    egress,
+		Cbuffer: 0,
+	}
+	class1 := netlink.NewHtbClass(classattrs1, htbclassattrs1)
+	if err := netlink.ClassAdd(class1); err != nil {
+		fmt.Println("Class add error: ", err)
+	}
+
+	// filter add
+	// tc filter add dev lo parent 1:0 prio 0 protocol all handle 5 fw flowid 1:5
+	filterattrs := netlink.FilterAttrs{
+		LinkIndex: l.Attrs().Index,
+		Parent:    netlink.MakeHandle(1, 0),
+		Handle:    netlink.MakeHandle(1, 1),
+		Priority:  49152,
+		Protocol:  unix.ETH_P_IP,
+	}
+
+	filter := &netlink.GenericFilter{
+		filterattrs,
+		"cgroup",
+	}
+
+	if err := netlink.FilterAdd(filter); err != nil {
+		fmt.Println("failed to add filter. Reason:%s", err)
+	}
+
+	// ingress
+	// tc filter add dev ens3f3 parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev ifb0
+	// set egress for ifb
+	mtu, err := getMTU(name)
+	if err != nil {
+		fmt.Println("failed to get MTU. Reason:%s", err)
+	}
+
+	ifbDeviceName := "ifb0"
+	err = CreateIfb(ifbDeviceName, mtu)
+	if err != nil {
+		fmt.Println("failed to create ifb0. Reason:%s", err)
+	}
+
+	fmt.Println("create ifb success")
+	err = CreateEgressQdisc(egress, egressBurst, name, ifbDeviceName)
+	if err != nil {
+		fmt.Println("failed to create egress qdisc. Reason:%s", err)
+	}
+
+	return nil
+	// })
 }
 
 func cmdAdd(args *skel.CmdArgs) error {
@@ -187,9 +317,16 @@ func cmdAdd(args *skel.CmdArgs) error {
 	}
 	defer netns.Close()
 
-	hostInterface, err := getHostInterface(result.Interfaces, args.IfName, netns)
+	fmt.Println("***CHENYANG***, in ADD")
+	veth, hostInterface, err := getHostInterface(result.Interfaces, args.IfName, netns)
 	if err != nil {
 		return err
+	}
+
+	var net = "net1"
+	if veth == true {
+		fmt.Println("***CHENYANG***, createwithtc")
+		createwithtc(netns, bandwidth.EgressRate, bandwidth.EgressBurst, net) //eth0?
 	}
 
 	if bandwidth.IngressRate > 0 && bandwidth.IngressBurst > 0 {
@@ -287,7 +424,7 @@ func cmdCheck(args *skel.CmdArgs) error {
 	}
 	defer netns.Close()
 
-	hostInterface, err := getHostInterface(result.Interfaces, args.IfName, netns)
+	_, hostInterface, err := getHostInterface(result.Interfaces, args.IfName, netns)
 	if err != nil {
 		return err
 	}
