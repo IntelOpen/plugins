@@ -145,7 +145,6 @@ func getHostInterface(interfaces []*current.Interface, containerIfName string, n
 		return nil
 	})
 	if peerIndex <= 0 {
-		fmt.Println("***CHENYANG***, peerIndex <= 0")
 		return true, nil, nil
 		// return nil, fmt.Errorf("container interface %s has no veth peer: %v", containerIfName, err)
 	}
@@ -189,7 +188,6 @@ func createwithtc(netns ns.NetNS, egress, egressBurst uint64, name string) error
 	// 	return
 	// }
 
-	defer netns.Close()
 
 	return netns.Do(func(_ ns.NetNS) error {
 
@@ -206,8 +204,6 @@ func createwithtc(netns ns.NetNS, egress, egressBurst uint64, name string) error
 		var htb *netlink.Htb
 		var hasHtb = false
 		for _, qdisc := range qdiscs {
-			fmt.Printf("current qdisc is %s\n", qdisc)
-
 			h, isHTB := qdisc.(*netlink.Htb)
 			if isHTB {
 				htb = h
@@ -315,20 +311,20 @@ func cmdAdd(args *skel.CmdArgs) error {
 	}
 	defer netns.Close()
 
-	fmt.Println("***CHENYANG***, in ADD")
 	veth, hostInterface, err := getHostInterface(result.Interfaces, args.IfName, netns)
-	if err != nil {
-		return err
-	}
+	
 
 	var net = "net1"
 	if veth == true {
-		fmt.Println("***CHENYANG***, createwithtc")
 		err := createwithtc(netns, bandwidth.EgressRate, bandwidth.EgressBurst, net) //eth0?
 		if err != nil {
 			return err
 		}
-		return types.PrintResult(conf.PrevResult, conf.CNIVersion)
+		return types.PrintResult(result, conf.CNIVersion)
+	} else {
+		if err != nil {
+			return err
+		}	
 	}
 
 	if bandwidth.IngressRate > 0 && bandwidth.IngressBurst > 0 {
