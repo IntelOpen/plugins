@@ -191,17 +191,17 @@ func createwithtc(netns ns.NetNS, egress, egressBurst uint64, name string) error
 
 	defer netns.Close()
 
-	_ = netns.Do(func(_ ns.NetNS) error {
+	return netns.Do(func(_ ns.NetNS) error {
 
 		// egress
 		l, err := netlink.LinkByName(name)
 		if err != nil {
-			fmt.Printf("get link by name %s in the container namespace %s\n", name, err)
+			return fmt.Errorf("get link by name %s in the container namespace %s\n", name, err)
 		}
 
 		qdiscs, err := safeQdiscList(l)
 		if err != nil {
-			fmt.Printf("get current qdisc in the container namespace of %s\n", err)
+			return fmt.Errorf("get current qdisc in the container namespace of %s\n", err)
 		}
 		var htb *netlink.Htb
 		var hasHtb = false
@@ -227,7 +227,7 @@ func createwithtc(netns ns.NetNS, egress, egressBurst uint64, name string) error
 			htb = netlink.NewHtb(attrs)
 			err = netlink.QdiscAdd(htb)
 			if err != nil {
-				fmt.Println("QdiscAdd error: %s\n", err)
+				return fmt.Errorf("QdiscAdd error: %s\n", err)
 			}
 		}
 
@@ -245,7 +245,7 @@ func createwithtc(netns ns.NetNS, egress, egressBurst uint64, name string) error
 		}
 		class1 := netlink.NewHtbClass(classattrs1, htbclassattrs1)
 		if err := netlink.ClassAdd(class1); err != nil {
-			fmt.Println("Class add error: ", err)
+			return fmt.Errorf("Class add error: ", err)
 		}
 
 		// filter add
@@ -264,7 +264,7 @@ func createwithtc(netns ns.NetNS, egress, egressBurst uint64, name string) error
 		}
 
 		if err := netlink.FilterAdd(filter); err != nil {
-			fmt.Println("failed to add filter. Reason:%s", err)
+			return fmt.Errorf("failed to add filter. Reason:%s", err)
 		}
 
 		// ingress
@@ -272,23 +272,21 @@ func createwithtc(netns ns.NetNS, egress, egressBurst uint64, name string) error
 		// set egress for ifb
 		mtu, err := getMTU(name)
 		if err != nil {
-			fmt.Println("failed to get MTU. Reason:%s", err)
+			return fmt.Errorf("failed to get MTU. Reason:%s", err)
 		}
 
 		ifbDeviceName := "ifb0"
 		err = CreateIfb(ifbDeviceName, mtu)
 		if err != nil {
-			fmt.Println("failed to create ifb0. Reason:%s", err)
+			return fmt.Errorf("failed to create ifb0. Reason:%s", err)
 		}
 
-		fmt.Println("create ifb success")
 		err = CreateEgressQdisc(egress, egressBurst, name, ifbDeviceName)
 		if err != nil {
-			fmt.Println("failed to create egress qdisc. Reason:%s", err)
+			return fmt.Errorf("failed to create egress qdisc. Reason:%s", err)
 		}
 		return nil
 	})
-	return nil
 }
 
 func cmdAdd(args *skel.CmdArgs) error {
@@ -364,7 +362,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 		}
 	}
 
-	return types.PrintResult(result, conf.CNIVersion)
+	return types.PrintResult(conf.PrevResult, conf.CNIVersion)
 }
 
 func cmdDel(args *skel.CmdArgs) error {
