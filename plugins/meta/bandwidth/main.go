@@ -324,8 +324,11 @@ func cmdAdd(args *skel.CmdArgs) error {
 	var net = "net1"
 	if veth == true {
 		fmt.Println("***CHENYANG***, createwithtc")
-		return createwithtc(netns, bandwidth.EgressRate, bandwidth.EgressBurst, net) //eth0?
-
+		err := createwithtc(netns, bandwidth.EgressRate, bandwidth.EgressBurst, net) //eth0?
+		if err != nil {
+			return err
+		}
+		return types.PrintResult(conf.PrevResult, conf.CNIVersion)
 	}
 
 	if bandwidth.IngressRate > 0 && bandwidth.IngressBurst > 0 {
