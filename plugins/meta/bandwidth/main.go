@@ -20,7 +20,6 @@ import (
 	"math"
 
 	"github.com/vishvananda/netlink"
-	"golang.org/x/sys/unix"
 
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
@@ -146,7 +145,6 @@ func getHostInterface(interfaces []*current.Interface, containerIfName string, n
 	})
 	if peerIndex <= 0 {
 		return true, nil, nil
-		// return nil, fmt.Errorf("container interface %s has no veth peer: %v", containerIfName, err)
 	}
 
 	// find host interface by index
@@ -180,87 +178,14 @@ func safeQdiscList(link netlink.Link) ([]netlink.Qdisc, error) {
 	return result, nil
 }
 
-func createwithtc(netns ns.NetNS, egress, egressBurst uint64, name string) error {
-	// fmt.Printf("tc set NIC %q of egress %d ingress %d in namespace %q\n", eth0, egress, ingress, namespace)
-	// netns, err := ns.GetNS(namespace)
-	// if err != nil {
-	// 	fmt.Printf("failed to open netns %q: %v", namespace, err)
-	// 	return
-	// }
-
-
+func createTc(netns ns.NetNS, ingress, ingressBurst, egress, egressBurst uint64, name string) error {
 	return netns.Do(func(_ ns.NetNS) error {
 
-		// egress
-		l, err := netlink.LinkByName(name)
-		if err != nil {
-			return fmt.Errorf("get link by name %s in the container namespace %s\n", name, err)
-		}
-
-		qdiscs, err := safeQdiscList(l)
-		if err != nil {
-			return fmt.Errorf("get current qdisc in the container namespace of %s\n", err)
-		}
-		var htb *netlink.Htb
-		var hasHtb = false
-		for _, qdisc := range qdiscs {
-			h, isHTB := qdisc.(*netlink.Htb)
-			if isHTB {
-				htb = h
-				hasHtb = true
-				break
-			}
-		}
-
-		if !hasHtb {
-			// qdisc
-			// tc qdisc add dev lo root handle 1:0 htb default 1
-			attrs := netlink.QdiscAttrs{
-				LinkIndex: l.Attrs().Index,
-				Handle:    netlink.MakeHandle(1, 0),
-				Parent:    netlink.HANDLE_ROOT,
-			}
-			htb = netlink.NewHtb(attrs)
-			err = netlink.QdiscAdd(htb)
+		if ingress > 0 && ingressBurst > 0 {
+			err := CreateIngressQdisc(egress, egressBurst, name)
 			if err != nil {
-				return fmt.Errorf("QdiscAdd error: %s\n", err)
+				return err
 			}
-		}
-
-		// htb parent class
-		// tc class add dev lo parent 1:0 classid 1:1 htb rate 125Mbps ceil 125Mbps prio 0
-		// preconfig
-		classattrs1 := netlink.ClassAttrs{
-			LinkIndex: l.Attrs().Index,
-			Parent:    netlink.MakeHandle(1, 0),
-			Handle:    netlink.MakeHandle(1, 1),
-		}
-		htbclassattrs1 := netlink.HtbClassAttrs{
-			Rate:    egress,
-			Cbuffer: 0,
-		}
-		class1 := netlink.NewHtbClass(classattrs1, htbclassattrs1)
-		if err := netlink.ClassAdd(class1); err != nil {
-			return fmt.Errorf("Class add error: ", err)
-		}
-
-		// filter add
-		// tc filter add dev lo parent 1:0 prio 0 protocol all handle 5 fw flowid 1:5
-		filterattrs := netlink.FilterAttrs{
-			LinkIndex: l.Attrs().Index,
-			Parent:    netlink.MakeHandle(1, 0),
-			Handle:    netlink.MakeHandle(1, 1),
-			Priority:  49152,
-			Protocol:  unix.ETH_P_IP,
-		}
-
-		filter := &netlink.GenericFilter{
-			filterattrs,
-			"cgroup",
-		}
-
-		if err := netlink.FilterAdd(filter); err != nil {
-			return fmt.Errorf("failed to add filter. Reason:%s", err)
 		}
 
 		// ingress
@@ -277,7 +202,7 @@ func createwithtc(netns ns.NetNS, egress, egressBurst uint64, name string) error
 			return fmt.Errorf("failed to create ifb0. Reason:%s", err)
 		}
 
-		err = CreateEgressQdisc(egress, egressBurst, name, ifbDeviceName)
+		err = CreateEgressQdisc(ingress, ingressBurst, name, ifbDeviceName)
 		if err != nil {
 			return fmt.Errorf("failed to create egress qdisc. Reason:%s", err)
 		}
@@ -311,12 +236,10 @@ func cmdAdd(args *skel.CmdArgs) error {
 	}
 	defer netns.Close()
 
-	veth, hostInterface, err := getHostInterface(result.Interfaces, args.IfName, netns)
-	
+	noveth, hostInterface, err := getHostInterface(result.Interfaces, args.IfName, netns)
 
-	var net = "net1"
-	if veth == true {
-		err := createwithtc(netns, bandwidth.EgressRate, bandwidth.EgressBurst, net) //eth0?
+	if noveth == true {
+		err := createTc(netns, bandwidth.IngressRate, bandwidth.IngressBurst, bandwidth.EgressRate, bandwidth.EgressBurst, args.IfName)
 		if err != nil {
 			return err
 		}
@@ -324,7 +247,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 	} else {
 		if err != nil {
 			return err
-		}	
+		}
 	}
 
 	if bandwidth.IngressRate > 0 && bandwidth.IngressBurst > 0 {
